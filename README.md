@@ -4,7 +4,7 @@ Cria uma **cópia leve de um vídeo para mandar pelo WhatsApp**. Foi feito para 
 
 - O vídeo **original não é alterado**. A cópia sai na mesma pasta, como `<nome> (WhatsApp).mp4`.
 - Mantém **Full HD (1920x1080)** para o texto das telas continuar legível.
-- Se a cópia passar de **15 MB** (limite do WhatsApp: 16 MB), refaz em **720p** automaticamente.
+- Se a cópia passar de **15 MB** (limite do WhatsApp: 16 MB), refaz em **720p**. Se ainda passar, calcula a qualidade para caber. Se nem assim couber (vídeo muito longo), avisa para mandar como **Documento**.
 - Mostra uma **janela com barra de progresso** e botão **Cancelar** (no KDE), e a porcentagem no terminal.
 
 Exemplo real: uma gravação de 2 minutos com **38,5 MB** virou **4,5 MB** em Full HD.
@@ -35,6 +35,7 @@ video-whatsapp video1.mp4 video2.mkv    # vários de uma vez
 |---|---|
 | até uns **6 minutos** | **Full HD** (1920x1080) |
 | acima de uns 6–7 minutos | 720p, para caber no WhatsApp |
+| muito longo (dezenas de minutos) | 720p com qualidade reduzida para caber; se nem assim couber, o aviso final pede para mandar como Documento |
 
 O limite é aproximado: telas paradas (formulários) gastam pouco, e rolar listas ou abrir muitas janelas gasta mais. Para vídeos longos em Full HD, mande pelo WhatsApp como **documento** (📎 → Documento, até 2 GB).
 
@@ -103,7 +104,7 @@ Tudo está em [`bin/video-whatsapp`](bin/video-whatsapp), um script bash.
    - áudio: AAC 96 kbps, mono (voz);
    - `-movflags +faststart`: o vídeo começa a tocar antes de baixar inteiro.
 4. **Progresso:** o `ffmpeg` roda com `-progress pipe:1`. O script lê o `out_time_us` e atualiza a janela do `kdialog --progressbar` via D-Bus (`qdbus6`). Se o usuário clicar em **Cancelar**, o `ffmpeg` é encerrado e a cópia pela metade é apagada.
-5. **Limite:** se a cópia passar de `LIMITE_MB` (15), refaz com `-vf scale=-2:720` e `-crf 26`.
+5. **Limite:** se a cópia passar de `LIMITE_MB` (15), refaz com `-vf scale=-2:720` e `-crf 26`. Se ainda passar, faz uma 3ª passada em 720p com a taxa calculada para caber: `92% do limite × 8 ÷ duração − 96 kbps do áudio`, com `-b:v`/`-maxrate`. Se a taxa ficar abaixo de 150 kbps (vídeo longo demais), não tenta e avisa para mandar como Documento.
 
 Ajustes mais comuns:
 
@@ -125,5 +126,26 @@ video-whatsapp/
 ├── kde/video-whatsapp.desktop.in # menu do botão direito do Dolphin (modelo)
 ├── install.sh                    # instala para o usuário
 ├── uninstall.sh                  # remove
+├── LICENSE                       # licença MIT
 └── README.md                     # esta documentação
 ```
+
+---
+
+## Licença
+
+[MIT](LICENSE): livre para usar, copiar, modificar e distribuir, inclusive para uso comercial, desde que o aviso de copyright e a licença acompanhem o código.
+
+---
+
+## Testes feitos (14/11/2026)
+
+| Teste | Resultado |
+|---|---|
+| Gravação real do Portal, 2 min, 38,5 MB, sem argumento | ✅ 4,5 MB em Full HD |
+| Vídeo "pesado" (ruído em tela cheia), 10 s, 375 MB | ✅ Full HD 233 MB → 720p 44,9 MB → ajustado para **13,6 MB** |
+| Arquivo que já é `(WhatsApp)` | ✅ Avisa e não converte |
+| Arquivo inexistente | ✅ Mensagem de erro, código de saída 1 |
+| Vários vídeos de uma vez (`.mp4` e `.mkv`) | ✅ Converte os dois |
+| Barra de progresso | ✅ Chega a 99% em cada etapa e fecha em 100% |
+| Botão Cancelar e menu do Dolphin | Precisa de clique: testar à mão |

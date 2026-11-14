@@ -3,6 +3,8 @@ Type=Service
 MimeType=video/mp4;video/x-matroska;video/quicktime;video/webm;
 Actions=videoWhatsapp;
 X-KDE-Priority=TopLevel
+# Plasma 5 (KF5) exige o tipo; o Plasma 6 ignora
+X-KDE-ServiceTypes=KonqPopupMenu/Plugin
 
 [Desktop Action videoWhatsapp]
 Name=Converter para WhatsApp

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # video-whatsapp — cria uma cópia leve de um vídeo (gravação de tela) pra mandar pelo WhatsApp.
+# Licença: MIT (veja LICENSE) — Copyright (c) 2026 Edivan Carvalho
 #
 # Uso:
 #   video-whatsapp                      → converte o vídeo mais novo de ~/Vídeos/Portal Fiscal
@@ -8,7 +9,8 @@
 #
 # Gera "<nome> (WhatsApp).mp4" na mesma pasta; o original não é alterado.
 # Mantém a resolução (texto legível) e comprime bem gravação de tela.
-# Se passar de 15 MB, refaz em 720p pra caber no limite do WhatsApp (16 MB).
+# Se passar de 15 MB, refaz em 720p; se ainda passar, calcula a taxa pra caber no limite
+# do WhatsApp (16 MB). Se nem assim couber (vídeo muito longo), avisa pra mandar como Documento.
 # Mostra uma janela com barra de progresso (com Cancelar) e a porcentagem no terminal.
 
 set -uo pipefail
@@ -62,7 +64,8 @@ ffmpeg_com_progresso() {
   coproc FF { ffmpeg -y -v error -nostats -progress pipe:1 "$@" 2>/dev/null; }
   pid=$FF_PID
   while IFS= read -r linha <&"${FF[0]}"; do
-    if [[ "$linha" == out_time_us=* ]]; then
+    # no fim o ffmpeg manda "out_time_us=N/A": ignora (senão a barra voltava pra 0%)
+    if [[ "$linha" =~ ^out_time_us=[0-9]+$ ]]; then
       pct="$(awk -v us="${linha#*=}" -v d="$duracao" 'BEGIN { p = (d > 0 && us > 0) ? int(us / 10000 / d) : 0; if (p > 99) p = 99; print p }')"
       if [[ "$pct" != "$ultimo" ]]; then
         ultimo="$pct"
@@ -82,6 +85,17 @@ ffmpeg_com_progresso() {
   [[ $CANCELADO -eq 0 && $status -eq 0 ]]
 }
 
+# Uma etapa da conversão; em caso de cancelamento ou erro, apaga a cópia pela metade e avisa.
+etapa() {
+  local nome="$1" saida="$2"; shift 2
+  ffmpeg_com_progresso "$@" && return 0
+  rm -f "$saida"; barra_fechar
+  if [[ $CANCELADO -eq 1 ]]; then avisar "Conversão cancelada: $nome"; else erro "Não consegui converter $nome."; fi
+  return 1
+}
+
+passou_do_limite() { awk -v t="$(tamanho_mb "$1")" -v l="$LIMITE_MB" 'BEGIN { exit !(t > l) }'; }
+
 converter() {
   local entrada="$1"
   [[ -f "$entrada" ]] || { erro "Arquivo não encontrado: $entrada"; return 1; }
@@ -91,33 +105,44 @@ converter() {
   nome="$(basename "$entrada")"
   saida="${entrada%.*} (WhatsApp).mp4"
   duracao="$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$entrada" 2>/dev/null)"
-  [[ -n "$duracao" ]] || duracao=0
+  [[ "$duracao" =~ ^[0-9]+(\.[0-9]+)?$ ]] || duracao=0
+  local audio=(-c:a aac -b:a 96k -ac 1 -movflags +faststart)
+  local x264=(-c:v libx264 -preset slow -tune stillimage -pix_fmt yuv420p -profile:v high)
 
   barra_abrir "Convertendo $nome…"
   echo "Convertendo: $nome"
 
-  if ! ffmpeg_com_progresso "$duracao" "Convertendo $nome…" -i "$entrada" \
-      -c:v libx264 -preset slow -crf 23 -tune stillimage -pix_fmt yuv420p -profile:v high \
-      -c:a aac -b:a 96k -ac 1 -movflags +faststart "$saida"; then
-    rm -f "$saida"; barra_fechar
-    if [[ $CANCELADO -eq 1 ]]; then avisar "Conversão cancelada: $nome"; else erro "Não consegui converter $nome."; fi
-    return 1
+  # 1ª tentativa: Full HD, qualidade constante (gravação de tela fica bem pequena)
+  etapa "$nome" "$saida" "$duracao" "Convertendo $nome…" \
+    -i "$entrada" "${x264[@]}" -crf 23 "${audio[@]}" "$saida" || return 1
+
+  # 2ª: ainda grande → 720p
+  if passou_do_limite "$saida"; then
+    echo "Ficou com $(tamanho_mb "$saida") MB — refazendo em 720p pra caber no WhatsApp…"
+    etapa "$nome" "$saida" "$duracao" "Ficou grande ($(tamanho_mb "$saida") MB) — refazendo menor (720p)…" \
+      -i "$entrada" -vf "scale=-2:720" "${x264[@]}" -crf 26 "${audio[@]}" "$saida" || return 1
   fi
 
-  if awk -v t="$(tamanho_mb "$saida")" -v l="$LIMITE_MB" 'BEGIN { exit !(t > l) }'; then
-    echo "Ficou com $(tamanho_mb "$saida") MB — refazendo em 720p pra caber no WhatsApp…"
-    if ! ffmpeg_com_progresso "$duracao" "Ficou grande ($(tamanho_mb "$saida") MB) — refazendo menor (720p)…" -i "$entrada" \
-        -vf "scale=-2:720" -c:v libx264 -preset slow -crf 26 -tune stillimage -pix_fmt yuv420p -profile:v high \
-        -c:a aac -b:a 96k -ac 1 -movflags +faststart "$saida"; then
-      rm -f "$saida"; barra_fechar
-      if [[ $CANCELADO -eq 1 ]]; then avisar "Conversão cancelada: $nome"; else erro "Não consegui converter $nome."; fi
-      return 1
+  # 3ª: vídeo muito longo ou com muito movimento → 720p com a taxa calculada pra caber no limite
+  # (92% do limite, descontado o áudio de 96 kbps)
+  if passou_do_limite "$saida" && [[ "$duracao" != 0 ]]; then
+    local kbps
+    kbps="$(awk -v l="$LIMITE_MB" -v d="$duracao" 'BEGIN { printf "%d", l * 8 * 1024 * 0.92 / d - 96 }')"
+    if (( kbps >= 150 )); then
+      echo "Ainda com $(tamanho_mb "$saida") MB — ajustando pra caber em $LIMITE_MB MB (${kbps} kbps)…"
+      etapa "$nome" "$saida" "$duracao" "Ainda grande ($(tamanho_mb "$saida") MB) — ajustando pra caber no WhatsApp…" \
+        -i "$entrada" -vf "scale=-2:720" "${x264[@]}" -b:v "${kbps}k" -maxrate "${kbps}k" -bufsize "$((kbps * 2))k" \
+        "${audio[@]}" "$saida" || return 1
     fi
   fi
 
   barra_valor 100
   barra_fechar
-  avisar "Pronto: $(basename "$saida") — $(tamanho_mb "$saida") MB (o original tem $(tamanho_mb "$entrada") MB)"
+  if passou_do_limite "$saida"; then
+    avisar "Pronto, mas ficou com $(tamanho_mb "$saida") MB — grande demais pra mandar como vídeo. No WhatsApp, mande como Documento (📎 → Documento): $(basename "$saida")"
+  else
+    avisar "Pronto: $(basename "$saida") — $(tamanho_mb "$saida") MB (o original tem $(tamanho_mb "$entrada") MB)"
+  fi
 }
 
 command -v ffmpeg >/dev/null || { erro "Precisa do ffmpeg: sudo apt install ffmpeg"; exit 1; }
