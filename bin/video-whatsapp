@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+# video-whatsapp — cria uma cópia leve de um vídeo (gravação de tela) pra mandar pelo WhatsApp.
+#
+# Uso:
+#   video-whatsapp                      → converte o vídeo mais novo de ~/Vídeos/Portal Fiscal
+#   video-whatsapp arquivo.mp4 [...]    → converte os vídeos indicados
+#   (ou botão direito no vídeo, no Dolphin → "Converter para WhatsApp")
+#
+# Gera "<nome> (WhatsApp).mp4" na mesma pasta; o original não é alterado.
+# Mantém a resolução (texto legível) e comprime bem gravação de tela.
+# Se passar de 15 MB, refaz em 720p pra caber no limite do WhatsApp (16 MB).
+# Mostra uma janela com barra de progresso (com Cancelar) e a porcentagem no terminal.
+
+set -uo pipefail
+export LC_NUMERIC=C  # contas com ponto decimal (no pt_BR o awk escreveria "4,5" e a comparação falharia)
+
+PASTA_PADRAO="$HOME/Vídeos/Portal Fiscal"
+LIMITE_MB=15
+QDBUS="$(command -v qdbus6 || command -v qdbus || true)"
+TEM_JANELA=0
+[[ -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ]] && command -v kdialog >/dev/null && [[ -n "$QDBUS" ]] && TEM_JANELA=1
+
+BARRA=""          # referência D-Bus da janela de progresso ("serviço caminho")
+CANCELADO=0
+
+avisar() {
+  echo "$1"
+  if [[ $TEM_JANELA -eq 1 ]]; then
+    kdialog --title "Vídeo para WhatsApp" --passivepopup "$1" 8 >/dev/null 2>&1 || true
+  fi
+}
+
+erro() {
+  echo "$1" >&2
+  if [[ $TEM_JANELA -eq 1 ]]; then
+    kdialog --title "Vídeo para WhatsApp" --error "$1" >/dev/null 2>&1 || true
+  fi
+}
+
+tamanho_mb() { awk -v b="$(stat -c %s "$1")" 'BEGIN { printf "%.1f", b / 1048576 }'; }
+
+# ---- janela de progresso (kdialog + D-Bus) ----
+barra_abrir() {
+  [[ $TEM_JANELA -eq 1 ]] || return 0
+  BARRA="$(kdialog --title "Vídeo para WhatsApp" --progressbar "$1" 100 2>/dev/null)" || BARRA=""
+  [[ -n "$BARRA" ]] && $QDBUS $BARRA showCancelButton true >/dev/null 2>&1
+}
+barra_texto() { [[ -n "$BARRA" ]] && $QDBUS $BARRA setLabelText "$1" >/dev/null 2>&1; return 0; }
+barra_valor() { [[ -n "$BARRA" ]] && $QDBUS $BARRA Set "" value "$1" >/dev/null 2>&1; return 0; }
+barra_cancelou() { [[ -n "$BARRA" ]] && [[ "$($QDBUS $BARRA wasCancelled 2>/dev/null)" == "true" ]]; }
+barra_fechar() { [[ -n "$BARRA" ]] && $QDBUS $BARRA close >/dev/null 2>&1; BARRA=""; return 0; }
+trap barra_fechar EXIT
+
+# Roda o ffmpeg mostrando o progresso. $1 = duração (s), $2 = texto da etapa, resto = argumentos do ffmpeg.
+# Retorna 1 se o usuário cancelou ou o ffmpeg falhou.
+ffmpeg_com_progresso() {
+  local duracao="$1" etapa="$2"; shift 2
+  local ultimo=-1 pct pid linha
+  barra_texto "$etapa"
+  barra_valor 0
+
+  coproc FF { ffmpeg -y -v error -nostats -progress pipe:1 "$@" 2>/dev/null; }
+  pid=$FF_PID
+  while IFS= read -r linha <&"${FF[0]}"; do
+    if [[ "$linha" == out_time_us=* ]]; then
+      pct="$(awk -v us="${linha#*=}" -v d="$duracao" 'BEGIN { p = (d > 0 && us > 0) ? int(us / 10000 / d) : 0; if (p > 99) p = 99; print p }')"
+      if [[ "$pct" != "$ultimo" ]]; then
+        ultimo="$pct"
+        barra_valor "$pct"
+        printf '\r  %s %3d%%' "$etapa" "$pct"
+      fi
+      if barra_cancelou; then
+        CANCELADO=1
+        kill "$pid" 2>/dev/null
+        break
+      fi
+    fi
+  done
+  wait "$pid" 2>/dev/null
+  local status=$?
+  printf '\n'
+  [[ $CANCELADO -eq 0 && $status -eq 0 ]]
+}
+
+converter() {
+  local entrada="$1"
+  [[ -f "$entrada" ]] || { erro "Arquivo não encontrado: $entrada"; return 1; }
+  case "$entrada" in *"(WhatsApp)."*) avisar "Esse já é uma cópia pro WhatsApp: $(basename "$entrada")"; return 0 ;; esac
+
+  local nome saida duracao
+  nome="$(basename "$entrada")"
+  saida="${entrada%.*} (WhatsApp).mp4"
+  duracao="$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$entrada" 2>/dev/null)"
+  [[ -n "$duracao" ]] || duracao=0
+
+  barra_abrir "Convertendo $nome…"
+  echo "Convertendo: $nome"
+
+  if ! ffmpeg_com_progresso "$duracao" "Convertendo $nome…" -i "$entrada" \
+      -c:v libx264 -preset slow -crf 23 -tune stillimage -pix_fmt yuv420p -profile:v high \
+      -c:a aac -b:a 96k -ac 1 -movflags +faststart "$saida"; then
+    rm -f "$saida"; barra_fechar
+    if [[ $CANCELADO -eq 1 ]]; then avisar "Conversão cancelada: $nome"; else erro "Não consegui converter $nome."; fi
+    return 1
+  fi
+
+  if awk -v t="$(tamanho_mb "$saida")" -v l="$LIMITE_MB" 'BEGIN { exit !(t > l) }'; then
+    echo "Ficou com $(tamanho_mb "$saida") MB — refazendo em 720p pra caber no WhatsApp…"
+    if ! ffmpeg_com_progresso "$duracao" "Ficou grande ($(tamanho_mb "$saida") MB) — refazendo menor (720p)…" -i "$entrada" \
+        -vf "scale=-2:720" -c:v libx264 -preset slow -crf 26 -tune stillimage -pix_fmt yuv420p -profile:v high \
+        -c:a aac -b:a 96k -ac 1 -movflags +faststart "$saida"; then
+      rm -f "$saida"; barra_fechar
+      if [[ $CANCELADO -eq 1 ]]; then avisar "Conversão cancelada: $nome"; else erro "Não consegui converter $nome."; fi
+      return 1
+    fi
+  fi
+
+  barra_valor 100
+  barra_fechar
+  avisar "Pronto: $(basename "$saida") — $(tamanho_mb "$saida") MB (o original tem $(tamanho_mb "$entrada") MB)"
+}
+
+command -v ffmpeg >/dev/null || { erro "Precisa do ffmpeg: sudo apt install ffmpeg"; exit 1; }
+
+if [[ $# -eq 0 ]]; then
+  ultimo="$(find "$PASTA_PADRAO" -maxdepth 1 -type f \( -iname '*.mp4' -o -iname '*.mkv' -o -iname '*.mov' \) \
+    ! -name '*(WhatsApp)*' -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -1 | cut -d' ' -f2-)"
+  [[ -n "$ultimo" ]] || { erro "Nenhum vídeo em $PASTA_PADRAO"; exit 1; }
+  set -- "$ultimo"
+fi
+
+for video in "$@"; do
+  [[ $CANCELADO -eq 1 ]] && break   # cancelou um: não segue pros próximos
+  converter "$video"
+done

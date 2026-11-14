@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Service
+MimeType=video/mp4;video/x-matroska;video/quicktime;video/webm;
+Actions=videoWhatsapp;
+X-KDE-Priority=TopLevel
+
+[Desktop Action videoWhatsapp]
+Name=Converter para WhatsApp
+Icon=document-send
+Exec=@BINDIR@/video-whatsapp %F
